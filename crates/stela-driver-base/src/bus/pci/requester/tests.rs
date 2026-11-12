@@ -691,6 +691,22 @@ fn containment_plan_on(config: &Config, root_bus: bool) -> Result<containment::P
 }
 
 #[test]
+fn msi_extended_message_data_capable_is_accepted_but_enabled_is_not() {
+    // RTX 5070 Ti (GB203) reports Message Control 0x0388 with MSI off:
+    // 16 vectors, 64-bit, per-vector masking, extended message data capable.
+    let mut function = endpoint();
+    cap(&mut function, 0x48, MSI, 0);
+    function.config().write16(0x4a, 0x0388).unwrap();
+    assert_eq!(validate_stopped(&mut function), Ok(()));
+    assert!(containment_plan(function.config()).is_ok());
+    function.config().write16(0x4a, 0x0788).unwrap();
+    assert_eq!(
+        validate_stopped(&mut function),
+        Err(ClaimError::MalformedCapability { offset: 0x48 })
+    );
+}
+
+#[test]
 fn containment_only_writes_the_exact_disabled_command_and_msi_controls() {
     use crate::bus::pci::ConfigEffect;
 

@@ -336,7 +336,9 @@ fn standard<C: ConfigSpace>(config: &C, status: u16) -> Result<(), ClaimError> {
                 let flags = inactive(config, offset + 2, 1)?;
                 let supported = (flags >> 1) & 7;
                 let selected = (flags >> 4) & 7;
-                if flags & !0x1ff != 0 || supported > 5 || selected > supported {
+                // Bit 9 is Extended Message Data Capable (read-only); the
+                // enable bit 10 stays refused.
+                if flags & !0x3ff != 0 || supported > 5 || selected > supported {
                     return Err(ClaimError::MalformedCapability { offset });
                 }
             }
