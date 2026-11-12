@@ -359,6 +359,9 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
             Operation::Map { fd, offset, size } => {
                 let pages = size / PAGE as usize;
                 let Some(address) = gpu.window.reserve(pages) else {
+                    output::arguments(format_args!(
+                        "GPU map fd={fd} size={size:#x}: window reserve of {pages} pages failed\n"
+                    ));
                     return ENOMEM;
                 };
                 match client::map(fd, address, size, offset) {
@@ -369,7 +372,11 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     }
                     Err(error) => {
                         gpu.window.release(address, pages);
-                        error.into()
+                        let errno = i64::from(error);
+                        output::arguments(format_args!(
+                            "GPU map fd={fd} offset={offset:#x} size={size:#x} failed errno={errno}\n"
+                        ));
+                        errno
                     }
                 }
             }
