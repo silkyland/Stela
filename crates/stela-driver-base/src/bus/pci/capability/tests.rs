@@ -4,6 +4,19 @@ use alloc::vec::Vec;
 
 struct Space([u8; 4096]);
 
+#[test]
+fn extended_next_pointer_ignores_reserved_low_bits_like_linux() {
+    for bits in 0..4 {
+        let mut space = Space::new();
+        space.extended(0x100, 1, 0x14c | bits);
+        space.extended(0x14c, 1, bits);
+        assert_eq!(
+            space.walk_extended(),
+            alloc::vec![Ok((0x100, 1, 4)), Ok((0x14c, 1, 4))]
+        );
+    }
+}
+
 impl Space {
     fn new() -> Self {
         let mut space = Self([0; 4096]);

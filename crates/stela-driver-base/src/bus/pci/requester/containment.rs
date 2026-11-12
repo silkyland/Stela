@@ -23,7 +23,7 @@ struct Control {
     /// regs::command_optional_bits); every other bit must read back exactly.
     optional: u16,
     /// Bits of `original` that `disabled` clears and hardware may hold set:
-    /// only the Bus Master bit of a root-bus host bridge.
+    /// only the Bus Master bit of a qualified root-bus platform function.
     hardwired: u16,
 }
 
@@ -54,13 +54,28 @@ impl Plan {
         // and Linux never writes it. There a set bit that stays set is the
         // hardware's, and the seal proves it ([`Plan::seal`]). A function
         // of that class behind a downstream port is contained like any other.
-        let class = read(regs::CLASS_REVISION, 4)? >> 8;
-        let hardwired = if root_bus && class >> 8 == HOST_BRIDGE {
+        let class_revision = read(regs::CLASS_REVISION, 4)?;
+        let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
+        // AMD's FCH LPC command register has a read-only Bus Master bit
+        // (BKDG 52740, section 3.26.9.1, D14F3x04). The observed 790e rev51
+        // reports 040f after a stopped-command write of 040b. Limit this
+        // compatibility rule to that identity/layout on the root bus, with
+        // no INTx pin or capability list. The existing seal still repeats
+        // the stopped write to acknowledge a bit that remains set; writable
+        // BME is cleared normally, and every other control is verified.
+        // This acknowledges a fixed platform control, not device-engine or
+        // legacy-DMA quiescence: no driver/resource-release grant is implied.
+        let amd_lpc = root_bus
+            && class_revision == 0x0601_0051
+            && pin == 0
+            && read(regs::VENDOR_ID, 4)? == 0x790e_1022
+            && read(regs::HEADER_TYPE, 1)? & 0x7f == 0
+            && read(regs::STATUS, 2)? & u32::from(regs::STATUS_CAP_LIST) == 0;
+        let hardwired = if (root_bus && class_revision >> 16 == HOST_BRIDGE) || amd_lpc {
             command & regs::COMMAND_MASTER
         } else {
             0
         };
-        let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
         plan.push(
             regs::COMMAND,
             command,
@@ -218,7 +233,7 @@ impl Plan {
     /// Acknowledge a contained function: its controls read back stopped,
     /// then its Bus Master bit is sealed. A clear bit is sealed as clear.
     /// A set bit is accepted only where this plan lets hardware hold it
-    /// (a root-bus host bridge whose bit was set) and only once the seal
+    /// (a qualified root-bus platform function whose bit was set) and only once the seal
     /// proves it hard-wired; anything else is refused.
     pub fn seal(&self, config: &mut impl MasterSeal) -> Result<(), ConfigError> {
         self.check_disabled(|offset| config.read16(offset))?;
@@ -243,9 +258,9 @@ pub trait MasterSeal: ConfigSpace {
     fn seal_bus_master(&mut self) -> Result<(), ConfigError>;
     /// Seal a function whose Bus Master bit hardware holds set, proven
     /// by writing the plan's stopped COMMAND, `disabled`, again
-    /// ([`hardwired_master`]): it cannot be cleared, and a function that
-    /// is the root complex's own masters no DMA through it, so it is left
-    /// as Linux leaves it. A bit that clears is sealed as clear instead.
+    /// ([`hardwired_master`]): it cannot be cleared at this boundary. The
+    /// plan must separately qualify the platform function; this seal grants
+    /// no engine/DMA ownership. A bit that clears is sealed as clear instead.
     fn seal_hardwired_bus_master(&mut self, disabled: u16) -> Result<(), ConfigError>;
 }
 

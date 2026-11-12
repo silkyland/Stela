@@ -748,6 +748,39 @@ pub fn store_usb_log() {
     flush_where(|sink| sink.kind == Log::Usb, true);
 }
 
+/// Recover native PCI/IOMMU diagnostics even when no disk became usable.
+/// Copy before formatting so no output lock/borrow survives screen updates.
+pub(crate) fn startup_pci_diagnostics() -> Vec<alloc::string::String> {
+    let bytes = exclusive(|| {
+        let mut bytes = Vec::new();
+        if let Ok(record) = RECORD.0.try_borrow() {
+            let _ = record.copy_since(0, |part| {
+                bytes.extend_from_slice(part);
+                Ok::<_, Infallible>(())
+            });
+        }
+        bytes
+    })
+    .unwrap_or_default();
+    let text = alloc::string::String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            line.contains("HOST IOMMU")
+                || line.contains("HOST IOAPIC")
+                || line.contains("UNSUPPORTED host IVRS")
+                || line.contains("UNSUPPORTED Stela PCI")
+                || line.contains("HOST PCI initial interrupt")
+                || (line.contains("HOST PCI bridge") && !line.contains("forwarding restored"))
+        })
+        .map(alloc::string::String::from)
+        .collect();
+    if lines.len() > 8 {
+        lines.drain(..lines.len() - 8);
+    }
+    lines
+}
+
 /// Begin storing the logs whose store is due, the machine state's every
 /// [`MACHINE_FLUSH_SECONDS`] and the USB's every [`USB_FLUSH_SECONDS`], and
 /// move every store in progress on; never waits for a device

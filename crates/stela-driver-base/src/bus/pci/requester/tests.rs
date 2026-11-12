@@ -827,6 +827,86 @@ fn contain(config: &mut Config, root_bus: bool) -> Result<(), crate::bus::pci::C
     plan.seal(config)
 }
 
+/// Exact AMD FCH LPC identity and stopped-command readback from the owner's
+/// Ryzen host: the Bus Master bit remains set, with no PCI interrupt pin.
+fn amd_fch_lpc(fixed: u16) -> Function<Config> {
+    let mut function = endpoint();
+    let config = function.config();
+    config.write32(0, 0x790e_1022).unwrap();
+    config.write32(8, 0x0601_0051).unwrap();
+    config.write8(regs::INTERRUPT_PIN, 0).unwrap();
+    config.write16(regs::COMMAND, 0x000f).unwrap();
+    config.command_fixed = fixed;
+    config.command_writes.clear();
+    function
+}
+
+#[test]
+fn containment_seals_the_known_amd_fch_lpc_fixed_bus_master() {
+    let mut function = amd_fch_lpc(regs::COMMAND_MASTER);
+    let config = function.config();
+    let plan = containment_plan_on(config, true).unwrap();
+    plan.apply(config).unwrap();
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x040f));
+    plan.seal(config).unwrap();
+    assert!(config.master_sealed);
+    assert_eq!(config.command_writes, [0x040b, 0x040b]);
+    assert!(plan.permits(regs::COMMAND, 2, 0x040b));
+    assert!(!plan.permits(regs::COMMAND, 2, 0x040f));
+    assert!(config.write16(regs::COMMAND, 0x040f).is_err());
+    // Every other command bit is still verified after acknowledging BME.
+    config.master_sealed = false;
+    config.write16(regs::COMMAND, 0x0407).unwrap();
+    assert!(plan.check_disabled(|offset| config.read16(offset)).is_err());
+}
+
+#[test]
+fn containment_clears_a_writable_amd_fch_lpc_bus_master() {
+    let mut function = amd_fch_lpc(0);
+    let config = function.config();
+    assert_eq!(contain(config, true), Ok(()));
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x040b));
+    assert!(config.master_sealed);
+    assert_eq!(config.command_writes, [0x040b]);
+}
+
+#[test]
+fn containment_does_not_extend_the_amd_lpc_quirk_to_other_functions() {
+    for (offset, value) in [
+        (0, 0x790e_8086), // another vendor
+        (0, 0x790b_1022), // another AMD device
+        (8, 0x0601_0050), // another revision
+        (8, 0x0200_0051), // endpoint rather than LPC
+        (8, 0x0604_0051), // forwarding bridge
+    ] {
+        let mut function = amd_fch_lpc(0);
+        let config = function.config();
+        config.write32(offset, value).unwrap();
+        config.command_fixed = regs::COMMAND_MASTER;
+        assert!(contain(config, true).is_err());
+        assert!(!config.master_sealed);
+    }
+    for root_bus in [false, true] {
+        let mut function = amd_fch_lpc(regs::COMMAND_MASTER);
+        let config = function.config();
+        if root_bus {
+            config.write8(regs::INTERRUPT_PIN, 1).unwrap();
+        }
+        assert!(contain(config, root_bus).is_err());
+        assert!(!config.master_sealed);
+    }
+    let mut function = amd_fch_lpc(regs::COMMAND_MASTER);
+    let config = function.config();
+    config.write8(regs::HEADER_TYPE, 1).unwrap();
+    assert!(contain(config, true).is_err());
+    assert!(!config.master_sealed);
+    let mut function = amd_fch_lpc(regs::COMMAND_MASTER);
+    let config = function.config();
+    config.write16(regs::STATUS, regs::STATUS_CAP_LIST).unwrap();
+    assert!(contain(config, true).is_err());
+    assert!(!config.master_sealed);
+}
+
 /// A Q35-like host bridge on the root bus whose Bus Master bit firmware
 /// left set and software can clear: it is cleared and sealed as every
 /// other function is.

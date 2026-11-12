@@ -848,6 +848,17 @@ impl Observer {
 }
 
 impl stela_drivers::probe::Observer for Observer {
+    fn realtek_checkpoint(&mut self, identity: &stela_drivers::bus::pci::Identity, stage: &str) {
+        // The Realtek constructor owns no USB controller borrow at these
+        // explicit boundaries. Use the existing HeldLog path under the
+        // driver's root and lock, rather than re-entering Service's lock.
+        output::arguments(format_args!(
+            "HOST REALTEK CHECKPOINT pci={} next={stage}\n",
+            identity.address
+        ));
+        crate::status::progress(&format!("Realtek {}: {stage}", identity.address));
+        self.store();
+    }
     fn first(&self) -> Option<Address> {
         self.first.filter(|_| self.log.is_some())
     }
@@ -2106,6 +2117,7 @@ fn account(
         lines.push(String::from("Disks found: none."));
     }
     lines.extend(disks.into_iter().map(|disk| format!("Disk {disk}.")));
+    lines.extend(output::startup_pci_diagnostics());
     lines.push(String::from(match kept {
         Keeping::Log => "The boot log on the USB stick keeps these lines.",
         Keeping::Record(_) => {

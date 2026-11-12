@@ -210,6 +210,13 @@ fn function(
     {
         return Err(Issue::Sriov(address));
     }
+    // A function with no standard capability list cannot expose the PCIe
+    // capability required by SR-IOV. Do not probe its extended space: AMD
+    // dummy host bridges can alias 0x100 to vendor/device at 0x00, whose
+    // high bits then look like a malformed extended next pointer (14da -> 14d).
+    if read(read32, address, 4)? >> 16 & 0x10 == 0 {
+        return Ok(None);
+    }
     // An all-ones first extended header denotes no extended configuration,
     // including conventional PCI. Classification still examines every PF,
     // rather than inferring this function's role from that local absence.
@@ -305,6 +312,9 @@ mod tests {
     }
     fn pf(count: u16, offset: u16, stride: u16) -> [u32; 1024] {
         let mut words = plain();
+        words[1] = 0x0010_0000; // standard capability list exists
+        words[0x34 / 4] = 0x40;
+        words[0x40 / 4] = 0x0001_0010; // PCI Express v1
         words[0x100 / 4] = 0x10010;
         words[0x108 / 4] = 1;
         words[0x10c / 4] = 16 << 16;
@@ -321,6 +331,22 @@ mod tests {
         })
         .unwrap()
     }
+    #[test]
+    fn capless_amd_host_bridge_does_not_probe_aliased_extended_space() {
+        let mut reads = Vec::new();
+        let inventory = Inventory::capture(&[PF], |_, offset| {
+            reads.push(offset);
+            Ok(Some(match offset {
+                0 | 0x100 => 0x14da_1022,
+                _ => 0,
+            }))
+        })
+        .unwrap();
+        assert!(inventory.issues().is_empty());
+        assert_eq!(inventory.role(PF), FunctionRole::Physical);
+        assert!(!reads.contains(&0x100));
+    }
+
     #[test]
     fn transport_denial_aborts_without_absence_or_a_physical_role() {
         use crate::bus::pci::{ConfigError, ConfigFailure, assignment};

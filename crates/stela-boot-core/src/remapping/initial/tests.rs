@@ -16,6 +16,29 @@ const SMBUS: (u16, [u8; 3], (u16, u16)) = (0x00fc, [0x0c, 5, 0], (0x8086, 0x7aa3
 const NVME: (u16, [u8; 3], (u16, u16)) = (0x0100, [1, 8, 2], (0x144d, 0xa80a));
 const GPU: (u16, [u8; 3], (u16, u16)) = (0x0300, [3, 0, 0], (0x1002, 0x73bf));
 const SATA: (u16, [u8; 3], (u16, u16)) = (0x0400, [1, 6, 1], (0x1022, 0x7901));
+const ROOT_PORT: Function = (0x0009, [6, 4, 0], (0x1022, 0x14db));
+
+#[test]
+fn physical_dma_behind_cold_bridges_does_not_select_an_unforwardable_window() {
+    let (_, requesters) = census(&[ROOT_PORT, NVME, XHCI]);
+    let candidates = [Candidate {
+        segment: 0,
+        decision: Ok(vec![ROOT_PORT.0, NVME.0, XHCI.0]),
+        blockable: true,
+    }];
+    assert_eq!(
+        modes(&candidates, &requesters, true),
+        [Mode::Left(Left::Native {
+            segment: 0,
+            rid: ROOT_PORT.0,
+        })]
+    );
+    // No firmware-off proof: never take the untranslated fallback.
+    assert_eq!(modes(&candidates, &requesters, false), [Mode::Window]);
+    // With no physical-address driver, a fully blocked native fabric still works.
+    let (_, native_only) = census(&[ROOT_PORT]);
+    assert_eq!(modes(&candidates, &native_only, true), [Mode::Blocked]);
+}
 
 type Function = (u16, [u8; 3], (u16, u16));
 
@@ -117,7 +140,7 @@ fn needs_follow_the_driver_probe_attaches() {
     for physical in [NVME, XHCI, SATA] {
         assert_eq!(need(physical), Need::Physical, "{physical:x?}");
     }
-    for native in [VMD, EHCI_HOST] {
+    for native in [VMD, EHCI_HOST, ROOT_PORT] {
         assert_eq!(need(native), Need::Native, "{native:x?}");
     }
     for nothing in [HOST, IGPU, AUDIO, SMBUS, GPU] {

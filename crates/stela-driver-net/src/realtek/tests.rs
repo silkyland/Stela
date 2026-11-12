@@ -251,6 +251,7 @@ mod g_revisions;
 mod h_revisions;
 mod legacy;
 mod link_state;
+mod mapped_aperture;
 mod modern_protocol;
 mod nbase_8126;
 mod nbase_ab;

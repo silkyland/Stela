@@ -524,7 +524,8 @@ impl<R: CapabilityRead> ExtendedCapabilities<R> {
             bytes,
             layout,
         };
-        Ok(Some((capability, (header >> 20) as u16)))
+        // PCI_EXT_CAP_NEXT in Linux: bits 1:0 of the next field are reserved.
+        Ok(Some((capability, ((header >> 20) & 0xffc) as u16)))
     }
 
     /// The body size of extended capability `id` at `offset` (pci_regs.h).

@@ -170,6 +170,9 @@ impl Remappers {
 
     pub(in crate::engine) fn forward_pci_bridges(&self, pci: &native_mmio::ContainedPci<'_>) {
         let Some(lines) = &self.initial_lines else {
+            output::arguments(format_args!(
+                "HOST PCI bridge forwarding unavailable: initial interrupt paths were not qualified\n"
+            ));
             return;
         };
         let source = pci.source();

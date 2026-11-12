@@ -1169,12 +1169,18 @@ impl Source {
                 crate::apic::rdtsc().wrapping_sub(started) >= limit
             })?;
             // Stopped controls read back, and Bus Master is sealed: clear,
-            // or proven hard-wired on a root-bus host bridge.
+            // or acknowledged as fixed on a qualified root platform function.
             plan.seal(&mut config)?;
             if header.bridge.is_some() {
                 config.seal_bus_routing()?;
             }
             header.verify(|offset| config.try_read32(offset))?;
+            if header.identity == 0x790e_1022 && header.class_revision == 0x0601_0051 {
+                let command = config.try_read16(COMMAND)?;
+                crate::output::arguments(format_args!(
+                    "HOST PCI AMD FCH LPC 1022:790e rev=51 sealed command={command:#06x}\n"
+                ));
+            }
             Ok(())
         })();
         if let Err(cause) = acknowledge {

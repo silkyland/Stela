@@ -283,58 +283,96 @@ impl Realtek {
         provider: &dyn resources::Provider,
         minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
     ) -> Result<Self, Error> {
+        // SAFETY: forwarded unchanged; the default observer does nothing.
+        unsafe { Self::new_observed(function, handoff, dma, provider, minimum, |_| {}) }
+    }
+
+    /// As [`Self::new`], reporting the next initialization stage before it
+    /// runs. The callback may persist diagnostics on an already-started,
+    /// independent controller. It must not access this function or `dma`.
+    ///
+    /// # Safety
+    /// The ownership and mapping requirements of [`Self::new`] apply.
+    pub unsafe fn new_observed(
+        function: &mut Function,
+        handoff: &Handoff,
+        dma: &mut dyn DmaAllocator,
+        provider: &dyn resources::Provider,
+        minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
+        mut checkpoint: impl FnMut(&str),
+    ) -> Result<Self, Error> {
+        checkpoint("clock and PCI identity");
         let clock = crate::timing::Timing::checked(handoff.clock, minimum)?;
         if !matches(function) {
             return Err(
                 BlockError::Unsupported("not a supported Realtek PCI Ethernet candidate").into(),
             );
         }
+        checkpoint("PCIe ASPM");
         let pcie_link_control = prepare_pcie_link(function, |function| {
             // SAFETY: caller grants exclusive PCI segment access and valid ECAM.
             unsafe { pci::disable_aspm_link(function, handoff) }
         })?;
+        checkpoint("PCI power D0");
         function.power_up(clock.minimum())?;
+        checkpoint("PCI BAR sizing");
         let bars = function.bars()?;
         let bar = bars
             .into_iter()
             .flatten()
             .find(|b| matches!(b, pci::Bar::Memory { .. }));
+        checkpoint("map MMIO");
         let device = map_registers(handoff, bar, 0, 256)?;
+        checkpoint("enable polled PCI command");
         function.enable_polled()?;
+        checkpoint("read TxConfig and detect MAC revision");
         let txconfig = device.read32(TX_CONFIG);
-        let revision = detect_revision(&device, txconfig, |bytes| {
-            map_registers(handoff, bar, 0, bytes).map(|_| ())
+        let (device, revision) = mapped_revision(device, txconfig, |bytes| {
+            map_registers(handoff, bar, 0, bytes)
         })?;
         admit_revision(function.device, pcie_link_control, revision)?;
+        checkpoint("read PHY status");
         if tbi_mode(revision, device.read8(PHY_STATUS)) {
             return Err(BlockError::Unsupported("Realtek TBI/fiber mode").into());
         }
         // rtl_alloc_irq keeps versions before 18 on INTx, which stays off.
+        checkpoint("enable MSI or MSI-X");
         let signalled = match handoff.completion {
             Some(message) if revision.version >= 18 => {
                 function.enable_message(handoff, &bars, message)?
             }
             _ => false,
         };
+        checkpoint("read subsystem identity");
         let subsystem = function.config().read32(0x2c)?;
         let mut hardware = Hardware::new(&device, &clock, revision, function.address.function);
+        checkpoint("read SFP MAC OCP");
         if revision.nbase() && hardware.mac_ocp_read(0xd006)? & 0xff == 7 {
             return Err(BlockError::Unsupported("Realtek SFP mode").into());
         }
+        checkpoint("initialize modern MAC");
         hardware.initialize_modern()?;
+        checkpoint("first MAC reset");
         hardware.reset()?;
+        checkpoint("DP start");
         hardware.dp_start()?;
+        checkpoint("EP start");
         hardware.ep_start()?;
         if revision.version <= 6 {
             function.config().write16(0x0c, 0x4008)?; // Linux cache-line/latency values, narrow config write.
             device.write8(0x82, 1);
         }
+        checkpoint("read station address");
         let mac = read_station(&hardware)?;
         let identity = format!("{:04x}:{:04x}", function.vendor, function.device);
         let mut warnings = Vec::new();
+        checkpoint("load optional firmware");
         let script = optional_firmware(provider, &identity, revision, &mut warnings);
+        checkpoint("configure PHY and apply firmware");
         warnings.extend(hardware.configure_phy(script.as_ref(), subsystem == 0xe000_1458)?);
+        checkpoint("second MAC reset");
         hardware.reset()?; // Linux resets the MAC again after PHY initialization.
+        checkpoint("configure MAC");
         hardware.configure_mac(script.as_ref())?;
         if revision.version == 28 {
             // The exact DP4 start branch enables CLKREQ after EPHY setup.
@@ -345,11 +383,15 @@ impl Realtek {
             clock_request(function.config(), offset, true)?;
         }
         // Nothing has a descriptor address yet. Allocation faults cannot start DMA.
+        checkpoint("allocate RX DMA ring");
+        let receive = Ring::new(dma, revision.version >= 18)?;
+        checkpoint("allocate TX DMA ring");
+        let transmit = Ring::new(dma, revision.version >= 18)?;
         let mut net = Self {
             device,
             clock,
-            receive: Ring::new(dma, revision.version >= 18)?,
-            transmit: Ring::new(dma, revision.version >= 18)?,
+            receive,
+            transmit,
             mac,
             link: RuntimeLink::default(),
             revision,
@@ -361,18 +403,22 @@ impl Realtek {
             ),
             signalled,
         };
+        checkpoint("initialize DMA descriptors");
         net.receive.initialize(true);
         net.transmit.initialize(false);
         let hardware = Hardware::new(&net.device, &net.clock, revision, function.address.function);
+        checkpoint("publish DMA rings");
         if let Err(error) = publish(&hardware, &net.receive, &net.transmit, mac) {
             // Buffers remain boot-owned even if a disconnected/stuck device fails reset.
             let _ =
                 Hardware::new(&net.device, &net.clock, revision, function.address.function).reset();
             return Err(error.into());
         }
+        checkpoint("enable device interrupts");
         if net.signalled {
             hardware.interrupts_on(SIGNALLED_EVENTS);
         }
+        checkpoint("ready");
         Ok(net)
     }
 
@@ -572,6 +618,29 @@ fn detect_revision<R: Registers>(
         primary: ((txconfig >> 20) & 0xfcf) as u16,
         extended: raw,
     })
+}
+
+/// Keep the checked register view used by the physical driver, rather
+/// than only checking a larger BAR and continuing with the initial view.
+fn mapped_revision(
+    mut device: Mmio,
+    txconfig: u32,
+    mut map: impl FnMut(u64) -> Result<Mmio, BlockError>,
+) -> Result<(Mmio, Revision), Error> {
+    // An extended XID is itself outside the initial 256-byte view. Expand
+    // before detect_revision reads it, then keep the largest checked view
+    // for the station address and subsequent NBASE MAC programming.
+    if revision::needs_extended(txconfig) {
+        device = map(EXTENDED_REGISTER_BYTES)?;
+    }
+    let identity_registers = device;
+    let revision = detect_revision(&identity_registers, txconfig, |bytes| {
+        if (device.len() as u64) < bytes {
+            device = map(bytes)?;
+        }
+        Ok(())
+    })?;
+    Ok((device, revision))
 }
 
 /// The `revision` label of a firmware target: the chip's XID, and its

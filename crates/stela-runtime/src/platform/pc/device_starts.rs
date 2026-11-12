@@ -213,6 +213,10 @@ fn boot_skips(boot: &str) -> Option<Skips> {
     let mut skips = Skips::default();
     let mut pending = None;
     for line in boot.lines() {
+        // output::Output timestamps persisted lines once the TSC rate is
+        // known. Match the marker after that prefix, as well as raw early
+        // output and the unprefixed markers setup writes to clear skips.
+        let line = without_timestamp(line);
         if let Some(function) = Function::parse(line, START) {
             pending = Some(function);
         } else if line.starts_with(STARTED) {
@@ -233,9 +237,84 @@ fn boot_skips(boot: &str) -> Option<Skips> {
     marked.then_some(skips)
 }
 
+fn without_timestamp(line: &str) -> &str {
+    let Some((stamp, rest)) = line
+        .strip_prefix('[')
+        .and_then(|line| line.split_once("] "))
+    else {
+        return line;
+    };
+    let Some((seconds, millis)) = stamp.trim_start().split_once('.') else {
+        return line;
+    };
+    if !seconds.is_empty()
+        && seconds.bytes().all(|byte| byte.is_ascii_digit())
+        && millis.len() == 3
+        && millis.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        rest
+    } else {
+        line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_output_timestamp_prefix_is_removed() {
+        assert_eq!(
+            without_timestamp("[   44.857] HOST DEVICES STARTED"),
+            STARTED
+        );
+        assert_eq!(
+            without_timestamp("[123456.000] HOST DEVICES STARTED"),
+            STARTED
+        );
+        for prefix in ["[note] ", "[ 44.x57] ", "[ 44.85] ", "[ .857] ", "noise "] {
+            let text = boot(&[format!(
+                "{prefix}HOST DEVICE START pci=0000:0e:00.0 id=10ec:8125"
+            )]);
+            assert!(read(text.as_bytes()).is_empty(), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn timestamped_usb_stall_is_skipped_but_required_controllers_are_retried() {
+        let lan = function(0x0e, 0x10ec, 0x8125);
+        let text = "=== STELA BOOT 2 ===\n\
+                    [   44.831] HOST DEVICE START pci=0000:02:00.0 id=144d:a810\n\
+                    [   44.857] HOST DEVICE START pci=0000:0e:00.0 id=10ec:8125\n";
+        let skips = read(text.as_bytes());
+        assert!(skips.holds(&lan));
+        assert_eq!(skips.iter().count(), 1);
+        assert!(settled(text.as_bytes()));
+        assert_eq!(decide(&skips, &Needed::EMPTY, None, &lan), Decision::Skip);
+        let mut needs = Needed::EMPTY;
+        needs.add(lan.address);
+        assert_eq!(decide(&skips, &needs, None, &lan), Decision::Retry);
+        assert_eq!(
+            decide(&skips, &Needed::EMPTY, Some(lan.address), &lan),
+            Decision::Retry
+        );
+    }
+
+    #[test]
+    fn timestamped_completion_skip_and_clear_have_the_same_meaning_as_raw_markers() {
+        let lan = function(0x0e, 0x10ec, 0x8125);
+        let prefix = "=== STELA BOOT 2 ===\n\
+                      [   44.857] HOST DEVICE START pci=0000:0e:00.0 id=10ec:8125\n";
+        let finished = format!("{prefix}[   45.000] {STARTED}\n");
+        assert!(read(finished.as_bytes()).is_empty());
+        let skipped = format!(
+            "{prefix}=== STELA BOOT 3 ===\n[   45.000] {}\n[   46.000] {STARTED}\n",
+            lan.line(SKIPPED)
+        );
+        assert!(read(skipped.as_bytes()).holds(&lan));
+        let cleared = format!("{skipped}[   47.000] {CLEARED} by stela setup repair\n");
+        assert!(read(cleared.as_bytes()).is_empty());
+    }
 
     fn function(bus: u8, vendor: u16, device: u16) -> Function {
         Function {

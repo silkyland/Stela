@@ -7,7 +7,7 @@
 //! firmware handoff. They work only where that pool reaches memory
 //! unchanged: through a unit's window, which maps the pool one to one, or
 //! untranslated. A few drivers attach only through a cold preparation of
-//! their original requester (VMD, EHCI), which needs every unit blocked
+//! their original requester (VMD, EHCI, PCI bridge forwarding), which needs every unit blocked
 //! from the start or none taken at all.
 //!
 //! So a unit starts blocked only when no device behind it needs the pool,
@@ -31,14 +31,21 @@ pub enum Need {
     Physical,
     /// Its driver attaches only through a cold preparation of its original
     /// requester, and the machine needs it: the boot disk behind Intel VMD,
-    /// or the EHCI handoff that releases the firmware's legacy USB.
+    /// the EHCI handoff that releases the firmware's legacy USB, or the
+    /// PCI bridges that must resume forwarding before downstream DMA works.
     Native,
 }
 
 impl Need {
     /// What `function`'s driver needs, from the identity probe matches.
     pub fn of(function: &Identity) -> Self {
-        if function.class == EHCI
+        // forward_pci_bridges uses cold preparation and retained interrupt
+        // paths. Those are available for a complete blocked fabric or a
+        // proven-untranslated machine, not for the shared DMA-window mode.
+        // Treat forwarding as a native prerequisite so modes() can select
+        // its existing all-units-off fallback when physical drivers coexist.
+        if function.class[..2] == [6, 4]
+            || function.class == EHCI
             || stela_drivers::bus::vmd::Profile::identify(function.vendor, function.device).is_ok()
         {
             Self::Native

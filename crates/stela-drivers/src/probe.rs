@@ -1442,6 +1442,9 @@ pub trait Observer {
     fn starting(&mut self, _function: &crate::bus::pci::Identity) -> Start {
         Start::Run
     }
+    /// A Realtek initialization boundary. This driver holds no USB state
+    /// here, so diagnostics may use the already-started boot USB controller.
+    fn realtek_checkpoint(&mut self, _function: &crate::bus::pci::Identity, _stage: &str) {}
 }
 
 /// Whether a function's driver runs, as [`Observer::starting`] decides.
@@ -1874,10 +1877,21 @@ pub unsafe fn probe_observed(
                 attach_link!(attached, Adapter::Atl1c);
             } else if realtek::matches(&function) {
                 let minimum = minimum_for_function!().clone();
+                let identity = function.identity();
                 // SAFETY: the caller granted exclusive post-EBS ownership of
                 // mapped PCI/MMIO and DMA, including upstream ASPM configuration.
-                let attached =
-                    unsafe { Realtek::new(&mut function, handoff, dma, firmware, minimum.clone()) };
+                let attached = unsafe {
+                    Realtek::new_observed(
+                        &mut function,
+                        handoff,
+                        dma,
+                        firmware,
+                        minimum.clone(),
+                        |stage| {
+                            observer.realtek_checkpoint(&identity, stage);
+                        },
+                    )
+                };
                 if let Ok(device) = &attached {
                     devices.warnings.extend(
                         device
@@ -1886,7 +1900,11 @@ pub unsafe fn probe_observed(
                             .map(|warning| (address, Warning::Realtek(*warning))),
                     );
                 }
-                if attached.is_err() {
+                if let Err(error) = &attached {
+                    observer.realtek_checkpoint(
+                        &identity,
+                        &alloc::format!("quiesce after initialization error: {error}"),
+                    );
                     start.quiesce(&mut function);
                 }
                 attach_link!(attached, Adapter::Realtek);

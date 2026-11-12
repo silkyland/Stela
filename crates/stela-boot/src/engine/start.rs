@@ -2482,6 +2482,28 @@ fn start_platform(
     // The IOAPICs are the operating system's after ExitBootServices, as
     // every OS takes them: firmware and SMM program no routes at runtime.
     if let Some(pci) = &contained_pci {
+        // ExitBootServices and AP takeover have ended firmware IRQ users.
+        // The BSP owns the original legacy controllers independently of
+        // the MMIO IOAPIC grant. InitialPciLines requires both 8259 masks
+        // closed, but IOAPIC containment cannot close those I/O-port masks.
+        // Only touch the IMRs when MADT says the original pair exists; no
+        // reinitialization, vector change, or interrupt acknowledgement.
+        if pci
+            .source()
+            .routing()
+            .is_ok_and(|routing| routing.has_legacy_pic())
+        {
+            // SAFETY: original PC/AT PICs, exclusive native startup before
+            // any driver or SCI route is published, after firmware exit.
+            let (master, slave) = unsafe {
+                super::power::out8(0x21, 0xff);
+                super::power::out8(0xa1, 0xff);
+                (super::power::in8(0x21), super::power::in8(0xa1))
+            };
+            output::arguments(format_args!(
+                "HOST IOAPIC legacy PIC masks master={master:#04x} slave={slave:#04x}\n"
+            ));
+        }
         // SAFETY: firmware has exited and no driver or AP has started. The
         // original stopped PCI census and all-unit remapper pins remain held
         // while the sole BSP contains the IOAPICs.
