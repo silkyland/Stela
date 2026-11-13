@@ -142,7 +142,15 @@ pub(in crate::engine) fn take(wanted: (usize, usize)) {
                 return;
             }
             Err(error) => {
-                output::arguments(format_args!("GPU {}: no display: {error:?}\n", bound.name));
+                if matches!(error, DisplayError::Map) {
+                    let errno = client::last_map_error();
+                    output::arguments(format_args!(
+                        "GPU {}: no display: {error:?} map_errno={errno}\n",
+                        bound.name
+                    ));
+                } else {
+                    output::arguments(format_args!("GPU {}: no display: {error:?}\n", bound.name));
+                }
                 client::close_descriptor(fd);
             }
         }

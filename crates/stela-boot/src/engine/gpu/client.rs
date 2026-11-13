@@ -241,6 +241,11 @@ static REQUESTS: AtomicPtr<Request> = AtomicPtr::new(ptr::null_mut());
 /// on the spot instead of waiting for the boot PE, which may be waiting for it.
 static MAPPINGS: AtomicUsize = AtomicUsize::new(0);
 
+/// The negative result of the last failed [`map`], for a caller that flattens
+/// it to `Option::None` to report instead of dropping it: zero means no map
+/// has failed.
+static LAST_MAP_ERROR: AtomicI64 = AtomicI64::new(0);
+
 fn post(request: &Request) {
     let this = ptr::from_ref(request).cast_mut();
     let mut head = REQUESTS.load(Ordering::Relaxed);
@@ -1189,7 +1194,15 @@ pub(super) fn control(fd: c_int, request: u32, argument: *mut c_void) -> i64 {
 /// Maps `size` bytes of `fd` at `offset`.
 pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
     let address = submit(Operation::Map { fd, offset, size });
+    if address < 0 {
+        LAST_MAP_ERROR.store(address, Ordering::Relaxed);
+    }
     NonNull::new(u64::try_from(address).ok()? as *mut u8)
+}
+
+/// The negative errno [`map`] last failed with and clears it, or zero.
+pub(super) fn last_map_error() -> i64 {
+    LAST_MAP_ERROR.swap(0, Ordering::Relaxed)
 }
 
 /// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
